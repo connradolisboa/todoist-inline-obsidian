@@ -6,6 +6,7 @@ import {
 	Plugin,
 	TFile,
 } from "obsidian";
+import { keymap, EditorView } from "@codemirror/view";
 import { TodoistAPI } from "./src/api/TodoistAPI";
 import { SyncEngine } from "./src/sync/SyncEngine";
 import {
@@ -13,6 +14,31 @@ import {
 	TodoistInlineSettingTab,
 	DEFAULT_SETTINGS,
 } from "./src/settings";
+
+// Matches a task line where the tid comment is at the beginning of the content:
+// "  - [ ] <!-- tid:xxx --> rest of text"
+const TASK_TID_PREFIX_RE = /^(\s*- \[[ xX]\] )(<!-- tid:[a-zA-Z0-9_-]+ --> )/;
+
+function tidEnterHandler(view: EditorView): boolean {
+	const { state } = view;
+	const sel = state.selection.main;
+	if (!sel.empty) return false;
+	const line = state.doc.lineAt(sel.from);
+	const match = line.text.match(TASK_TID_PREFIX_RE);
+	if (!match) return false;
+	// Absolute position of the first character after the tid comment
+	const tidEnd = line.from + match[1].length + match[2].length;
+	if (sel.from < tidEnd) {
+		// Cursor is inside the hidden tid — nudge it to after the tid so
+		// Enter splits the line at the right place
+		view.dispatch({ selection: { anchor: tidEnd } });
+	}
+	return false; // let Obsidian's default Enter handling proceed
+}
+
+const tidProtectionExtension = keymap.of([
+	{ key: "Enter", run: tidEnterHandler },
+]);
 
 export default class TodoistInlinePlugin extends Plugin {
 	settings: TodoistInlineSettings;
@@ -71,6 +97,9 @@ export default class TodoistInlinePlugin extends Plugin {
 
 		// Settings tab
 		this.addSettingTab(new TodoistInlineSettingTab(this.app, this));
+
+		// Protect tid comments from being split off their task line
+		this.registerEditorExtension(tidProtectionExtension);
 
 		// Start auto-sync if enabled
 		this.restartAutoSync();

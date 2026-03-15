@@ -167,6 +167,6 @@ export function renderTaskLine(
 	const checkbox = checked ? "[x]" : "[ ]";
 	const priorityEmoji =
 		PRIORITY_TO_EMOJI[priority] ? ` ${PRIORITY_TO_EMOJI[priority]}` : "";
-	const tidComment = tid ? ` <!-- tid:${tid} -->` : "";
-	return `${spaces}- ${checkbox} ${content}${priorityEmoji}${tidComment}`;
+	const tidPrefix = tid ? `<!-- tid:${tid} --> ` : "";
+	return `${spaces}- ${checkbox} ${tidPrefix}${content}${priorityEmoji}`;
 }
