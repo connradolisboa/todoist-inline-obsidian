@@ -87,17 +87,34 @@ export class SyncEngine {
 			}
 		}
 
-		// Process new tasks (no tid) — must handle parents first
-		// Sort by indent so parents are created before children
+		// Process new tasks (no tid) — must handle parents before children.
+		// Sort by indent ascending so that root tasks (indent=0) are created
+		// before their children, which guarantees newTids has the parent ID
+		// ready by the time the child is processed.
 		const newTasks = noteTasks
 			.filter((t) => !t.tid)
 			.sort((a, b) => a.indent - b.indent);
 
 		for (const noteTask of newTasks) {
 			try {
-				// Resolve section
+				// Resolve parent tid — check the note task's own tid first
+				// (already-synced parent), then fall back to a newly-created tid.
+				let parentId: string | undefined;
+				if (noteTask.parentLineIndex !== null) {
+					const parentNoteTask = lineToNoteTask.get(
+						noteTask.parentLineIndex
+					);
+					if (parentNoteTask) {
+						parentId =
+							parentNoteTask.tid ??
+							newTids.get(parentNoteTask.line);
+					}
+				}
+
+				// Todoist does not allow section_id on subtasks — only root tasks
+				// can belong to a section.  Omit it whenever parent_id is set.
 				let sectionId: string | undefined;
-				if (noteTask.sectionName) {
+				if (!parentId && noteTask.sectionName) {
 					sectionId = sectionNameToId.get(noteTask.sectionName);
 					if (!sectionId) {
 						// Create section in Todoist
@@ -108,19 +125,6 @@ export class SyncEngine {
 						sectionNameToId.set(noteTask.sectionName, newSection.id);
 						sections.push(newSection);
 						sectionId = newSection.id;
-					}
-				}
-
-				// Resolve parent tid
-				let parentId: string | undefined;
-				if (noteTask.parentLineIndex !== null) {
-					const parentNoteTask = lineToNoteTask.get(
-						noteTask.parentLineIndex
-					);
-					if (parentNoteTask) {
-						parentId =
-							parentNoteTask.tid ??
-							newTids.get(parentNoteTask.line);
 					}
 				}
 
