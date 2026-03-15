@@ -3,7 +3,7 @@ import {
 	TodoistTask,
 	TodoistSection,
 } from "../api/TodoistAPI";
-import { parseNote, renderTaskLine, ParsedTask } from "../parser/NoteParser";
+import { parseNote, renderTaskLine } from "../parser/NoteParser";
 
 export interface SyncResult {
 	noteContent: string;
@@ -14,13 +14,15 @@ export interface SyncResult {
 	errors: string[];
 }
 
+const SECTION_REGEX = /^### (.+)$/;
+
 export class SyncEngine {
 	constructor(private api: TodoistAPI) {}
 
 	/**
 	 * Full 2-way sync:
 	 * 1. Push changes from note → Todoist (new tasks, completion changes, content changes)
-	 * 2. Pull latest state from Todoist → rebuild note
+	 * 2. Pull latest state from Todoist → update note in-place (preserving non-task lines)
 	 */
 	async sync(noteContent: string, projectId: string): Promise<SyncResult> {
 		const result: SyncResult = {
@@ -33,8 +35,7 @@ export class SyncEngine {
 		};
 
 		// Parse current note
-		const { tasks: noteTasks, frontmatterLines, preambleLines } =
-			parseNote(noteContent);
+		const { tasks: noteTasks } = parseNote(noteContent);
 
 		// Fetch current Todoist state
 		let [todoistTasks, sections] = await Promise.all([
@@ -47,20 +48,19 @@ export class SyncEngine {
 
 		// --- Phase 1: Push note → Todoist ---
 
-		// Build a map from line index → task for resolving parent relationships
+		// Map from line index → ParsedTask for parent lookups
 		const lineToNoteTask = new Map(noteTasks.map((t) => [t.line, t]));
 
-		// Track new tid assignments (line → tid) for tasks we create
+		// Tracks new tid assignments (note line index → created Todoist ID)
 		const newTids = new Map<number, string>();
 
-		// Process tasks with existing tids first (updates/completion changes)
+		// Process tasks with existing tids first (updates / completion changes)
 		for (const noteTask of noteTasks) {
 			if (!noteTask.tid) continue;
 			const todoistTask = taskIdToTodoist.get(noteTask.tid);
-			if (!todoistTask) continue; // task deleted in Todoist, will be removed on pull
+			if (!todoistTask) continue; // deleted in Todoist, handled on pull
 
 			try {
-				// Completion state sync
 				if (noteTask.checked && !todoistTask.is_completed) {
 					await this.api.closeTask(noteTask.tid);
 					result.tasksClosed++;
@@ -69,7 +69,6 @@ export class SyncEngine {
 					result.tasksReopened++;
 				}
 
-				// Content or priority changes
 				if (
 					noteTask.content !== todoistTask.content ||
 					noteTask.priority !== todoistTask.priority
@@ -87,18 +86,14 @@ export class SyncEngine {
 			}
 		}
 
-		// Process new tasks (no tid) — must handle parents before children.
-		// Sort by indent ascending so that root tasks (indent=0) are created
-		// before their children, which guarantees newTids has the parent ID
-		// ready by the time the child is processed.
+		// Process new tasks (no tid) sorted by indent so parents come first
 		const newTasks = noteTasks
 			.filter((t) => !t.tid)
 			.sort((a, b) => a.indent - b.indent);
 
 		for (const noteTask of newTasks) {
 			try {
-				// Resolve parent tid — check the note task's own tid first
-				// (already-synced parent), then fall back to a newly-created tid.
+				// Resolve parent — subtasks must not also carry section_id
 				let parentId: string | undefined;
 				if (noteTask.parentLineIndex !== null) {
 					const parentNoteTask = lineToNoteTask.get(
@@ -111,13 +106,11 @@ export class SyncEngine {
 					}
 				}
 
-				// Todoist does not allow section_id on subtasks — only root tasks
-				// can belong to a section.  Omit it whenever parent_id is set.
+				// Only root tasks (no parent) belong to a section
 				let sectionId: string | undefined;
 				if (!parentId && noteTask.sectionName) {
 					sectionId = sectionNameToId.get(noteTask.sectionName);
 					if (!sectionId) {
-						// Create section in Todoist
 						const newSection = await this.api.createSection(
 							projectId,
 							noteTask.sectionName
@@ -136,7 +129,6 @@ export class SyncEngine {
 					priority: noteTask.priority,
 				});
 
-				// If the new task was checked, close it immediately
 				if (noteTask.checked) {
 					await this.api.closeTask(created.id);
 					result.tasksClosed++;
@@ -151,146 +143,261 @@ export class SyncEngine {
 			}
 		}
 
-		// --- Phase 2: Pull Todoist → rebuild note ---
+		// --- Phase 2: Pull Todoist → update note in-place ---
 		[todoistTasks, sections] = await Promise.all([
 			this.api.getTasks(projectId),
 			this.api.getSections(projectId),
 		]);
 
-		result.noteContent = this.renderNote(
-			frontmatterLines,
-			preambleLines,
+		result.noteContent = this.updateNoteContent(
+			noteContent,
 			todoistTasks,
-			sections
+			sections,
+			newTids
 		);
 
 		return result;
 	}
 
 	/**
-	 * Pull-only sync: fetch from Todoist and update note without pushing changes.
-	 * Preserves checked state for tasks that exist in both note and Todoist.
+	 * Pull-only sync: fetch from Todoist and update note in-place.
+	 * Non-task lines are preserved; task lines are updated from Todoist.
 	 */
-	async pull(
-		noteContent: string,
-		projectId: string
-	): Promise<string> {
-		const { tasks: noteTasks, frontmatterLines, preambleLines } =
-			parseNote(noteContent);
+	async pull(noteContent: string, projectId: string): Promise<string> {
 		const [todoistTasks, sections] = await Promise.all([
 			this.api.getTasks(projectId),
 			this.api.getSections(projectId),
 		]);
-		return this.renderNote(
-			frontmatterLines,
-			preambleLines,
+		return this.updateNoteContent(
+			noteContent,
 			todoistTasks,
-			sections
+			sections,
+			new Map()
 		);
 	}
 
-	private renderNote(
-		frontmatterLines: string[],
-		preambleLines: string[],
-		tasks: TodoistTask[],
-		sections: TodoistSection[]
+	/**
+	 * Update the note content in-place:
+	 * - Preserve every line that is not a recognised task line
+	 * - Update task lines (with tid) from Todoist data
+	 * - Embed newly-created tids into lines for tasks just pushed
+	 * - Append new Todoist tasks that are not yet in the note
+	 * - Remove lines for tasks that no longer exist in Todoist
+	 */
+	private updateNoteContent(
+		originalContent: string,
+		todoistTasks: TodoistTask[],
+		sections: TodoistSection[],
+		newTids: Map<number, string>
 	): string {
-		// Group root tasks by section (parent_id == null)
-		const sectionBuckets = new Map<string | null, TodoistTask[]>();
-		sectionBuckets.set(null, []);
-		for (const s of sections) sectionBuckets.set(s.id, []);
+		const { tasks: noteTasks } = parseNote(originalContent);
+		const lines = originalContent.split("\n");
 
-		// Build child map and populate section buckets for root tasks
-		const childMap = new Map<string, TodoistTask[]>();
-		for (const task of tasks) {
-			if (task.parent_id) {
-				if (!childMap.has(task.parent_id))
-					childMap.set(task.parent_id, []);
-				childMap.get(task.parent_id)!.push(task);
-			} else {
-				const bucket = sectionBuckets.get(task.section_id ?? null);
-				if (bucket) {
-					bucket.push(task);
-				} else {
-					// Section exists in Todoist but not fetched (edge case)
-					sectionBuckets.get(null)!.push(task);
-				}
-			}
-		}
+		const tidToTodoist = new Map(todoistTasks.map((t) => [t.id, t]));
+		const sectionNameToId = new Map(sections.map((s) => [s.name, s.id]));
 
-		// Sort by order within each bucket
-		for (const bucket of sectionBuckets.values()) {
-			bucket.sort((a, b) => a.order - b.order);
-		}
-		for (const children of childMap.values()) {
-			children.sort((a, b) => a.order - b.order);
-		}
-
-		const outputLines: string[] = [];
-
-		// Frontmatter
-		if (frontmatterLines.length > 0) {
-			outputLines.push(...frontmatterLines);
-			outputLines.push("");
-		}
-
-		// Preamble
-		if (preambleLines.length > 0) {
-			outputLines.push(...preambleLines);
-			outputLines.push("");
-		}
-
-		// Unsectioned tasks
-		const unsectioned = sectionBuckets.get(null) ?? [];
-		for (const task of unsectioned) {
-			this.renderTaskTree(task, 0, childMap, outputLines);
-		}
-
-		// Sections
-		const sortedSections = [...sections].sort(
-			(a, b) => a.order - b.order
+		// Set of Todoist IDs already present in the note
+		const noteTaskTids = new Set(
+			noteTasks.filter((t) => t.tid).map((t) => t.tid!)
 		);
-		for (const section of sortedSections) {
-			const sectionTasks = sectionBuckets.get(section.id) ?? [];
-			if (outputLines.length > 0 && outputLines[outputLines.length - 1] !== "") {
-				outputLines.push("");
+
+		// Set of Todoist IDs we just created in the push phase — these are
+		// handled by embedding their tid into the existing note line, so they
+		// must not also be appended as "new tasks from Todoist".
+		const newlyCreatedTids = new Set(newTids.values());
+
+		// Build a child map for Todoist tasks NOT in the note (to render new subtrees)
+		const newTaskChildMap = new Map<string | null, TodoistTask[]>();
+		for (const task of todoistTasks) {
+			if (noteTaskTids.has(task.id)) continue;
+			if (newlyCreatedTids.has(task.id)) continue;
+			const key = task.parent_id ?? null;
+			if (!newTaskChildMap.has(key)) newTaskChildMap.set(key, []);
+			newTaskChildMap.get(key)!.push(task);
+		}
+		for (const arr of newTaskChildMap.values())
+			arr.sort((a, b) => a.order - b.order);
+
+		// Separate new tasks into:
+		//   newRootsBySectionId — root tasks not yet in the note, grouped by section
+		//   newSubsByParentTid  — subtasks of existing note tasks, grouped by parent tid
+		const newRootsBySectionId = new Map<string | null, TodoistTask[]>();
+		const newSubsByParentTid = new Map<string, TodoistTask[]>();
+
+		for (const [parentKey, tasks] of newTaskChildMap.entries()) {
+			for (const task of tasks) {
+				if (parentKey === null) {
+					// Root task not in note
+					const sKey = task.section_id ?? null;
+					if (!newRootsBySectionId.has(sKey))
+						newRootsBySectionId.set(sKey, []);
+					newRootsBySectionId.get(sKey)!.push(task);
+				} else if (noteTaskTids.has(parentKey)) {
+					// Subtask whose parent IS in the note
+					if (!newSubsByParentTid.has(parentKey))
+						newSubsByParentTid.set(parentKey, []);
+					newSubsByParentTid.get(parentKey)!.push(task);
+				}
+				// else: subtask of another new task — rendered recursively via renderNewTree
 			}
-			outputLines.push(`### ${section.name}`);
-			outputLines.push("");
-			for (const task of sectionTasks) {
-				this.renderTaskTree(task, 0, childMap, outputLines);
+		}
+
+		// Recursively render a new task and all its new children
+		const renderNewTree = (task: TodoistTask, indent: number): string[] => {
+			const result = [
+				renderTaskLine(
+					indent,
+					task.is_completed,
+					task.content,
+					task.priority,
+					task.id
+				),
+			];
+			const children = newTaskChildMap.get(task.id) ?? [];
+			for (const child of children) {
+				result.push(...renderNewTree(child, indent + 2));
 			}
+			return result;
+		};
+
+		// For each note task, compute the line index of the last task in its
+		// subtree (used to know where to append new children from Todoist).
+		const lastTaskLineOfSubtree = new Map<number, number>();
+		for (const t of noteTasks) lastTaskLineOfSubtree.set(t.line, t.line);
+		for (let i = noteTasks.length - 1; i >= 0; i--) {
+			const t = noteTasks[i];
+			if (t.parentLineIndex !== null) {
+				const cur =
+					lastTaskLineOfSubtree.get(t.parentLineIndex) ??
+					t.parentLineIndex;
+				const mine = lastTaskLineOfSubtree.get(t.line) ?? t.line;
+				lastTaskLineOfSubtree.set(t.parentLineIndex, Math.max(cur, mine));
+			}
+		}
+
+		// Per-line decisions: what replaces each line (undefined = keep as-is, null = delete)
+		const lineReplacement = new Map<number, string | null>();
+		// Lines to insert immediately AFTER a given line index
+		const insertAfter = new Map<number, string[]>();
+
+		const addInsertAfter = (lineIdx: number, newLines: string[]) => {
+			if (!insertAfter.has(lineIdx)) insertAfter.set(lineIdx, []);
+			insertAfter.get(lineIdx)!.push(...newLines);
+		};
+
+		for (const noteTask of noteTasks) {
+			if (noteTask.tid) {
+				const todoistTask = tidToTodoist.get(noteTask.tid);
+				if (!todoistTask) {
+					// Task no longer exists in Todoist → remove the line
+					lineReplacement.set(noteTask.line, null);
+				} else {
+					// Update line in-place with latest Todoist data
+					lineReplacement.set(
+						noteTask.line,
+						renderTaskLine(
+							noteTask.indent,
+							todoistTask.is_completed,
+							todoistTask.content,
+							todoistTask.priority,
+							todoistTask.id
+						)
+					);
+
+					// Append new Todoist subtasks after this task's last child line
+					const newSubs = newSubsByParentTid.get(noteTask.tid) ?? [];
+					if (newSubs.length > 0) {
+						const insertLine =
+							lastTaskLineOfSubtree.get(noteTask.line) ??
+							noteTask.line;
+						addInsertAfter(
+							insertLine,
+							newSubs.flatMap((sub) =>
+								renderNewTree(sub, noteTask.indent + 2)
+							)
+						);
+					}
+				}
+			} else {
+				// New task (no tid): embed tid if the push phase created it
+				const newTid = newTids.get(noteTask.line);
+				if (newTid) {
+					// Use fresh Todoist data if available; fall back to note
+					// data if the newly-created task isn't in the GET response
+					// yet (Todoist eventual consistency). Either way, the tid
+					// must be embedded so the task isn't re-created next sync.
+					const todoistTask = tidToTodoist.get(newTid);
+					lineReplacement.set(
+						noteTask.line,
+						renderTaskLine(
+							noteTask.indent,
+							todoistTask?.is_completed ?? noteTask.checked,
+							todoistTask?.content ?? noteTask.content,
+							todoistTask?.priority ?? noteTask.priority,
+							newTid
+						)
+					);
+				}
+				// No action otherwise — leave the line as typed
+			}
+		}
+
+		// Build output line-by-line, tracking the current section so we know
+		// where to append new root tasks from Todoist.
+		const output: string[] = [];
+		let currentSectionId: string | null = null;
+		const seenSectionIds = new Set<string | null>([null]);
+
+		const flushNewRootTasks = (sectionId: string | null) => {
+			const roots = newRootsBySectionId.get(sectionId) ?? [];
+			for (const task of roots) output.push(...renderNewTree(task, 0));
+		};
+
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+			const sectionMatch = line.match(SECTION_REGEX);
+
+			if (sectionMatch) {
+				// Leaving the current section — append any new root tasks for it
+				flushNewRootTasks(currentSectionId);
+				currentSectionId =
+					sectionNameToId.get(sectionMatch[1].trim()) ?? null;
+				seenSectionIds.add(currentSectionId);
+				output.push(line);
+			} else if (lineReplacement.has(i)) {
+				const replacement = lineReplacement.get(i);
+				if (replacement !== null && replacement !== undefined) {
+					output.push(replacement);
+				}
+				// null → line deleted, emit nothing
+			} else {
+				// Non-task line or unrecognised task line — preserve as-is
+				output.push(line);
+			}
+
+			// Insert new tasks scheduled after this line
+			const extra = insertAfter.get(i);
+			if (extra) output.push(...extra);
+		}
+
+		// Flush new root tasks for the final section
+		flushNewRootTasks(currentSectionId);
+
+		// Append entirely new sections from Todoist (not present in the note at all)
+		for (const section of [...sections].sort((a, b) => a.order - b.order)) {
+			if (seenSectionIds.has(section.id)) continue;
+			const roots = newRootsBySectionId.get(section.id) ?? [];
+			if (roots.length === 0) continue;
+			output.push("");
+			output.push(`### ${section.name}`);
+			output.push("");
+			for (const task of roots) output.push(...renderNewTree(task, 0));
 		}
 
 		// Remove trailing blank lines
-		while (
-			outputLines.length > 0 &&
-			outputLines[outputLines.length - 1] === ""
-		) {
-			outputLines.pop();
-		}
+		while (output.length > 0 && output[output.length - 1] === "")
+			output.pop();
 
-		return outputLines.join("\n");
-	}
-
-	private renderTaskTree(
-		task: TodoistTask,
-		indent: number,
-		childMap: Map<string, TodoistTask[]>,
-		outputLines: string[]
-	): void {
-		outputLines.push(
-			renderTaskLine(
-				indent,
-				task.is_completed,
-				task.content,
-				task.priority,
-				task.id
-			)
-		);
-		const children = childMap.get(task.id) ?? [];
-		for (const child of children) {
-			this.renderTaskTree(child, indent + 2, childMap, outputLines);
-		}
+		return output.join("\n");
 	}
 }
