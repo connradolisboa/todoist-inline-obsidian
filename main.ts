@@ -80,6 +80,32 @@ export default class TodoistInlinePlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "edit-task-on-current-line",
+			name: "Edit task on current line",
+			editorCallback: async (editor: Editor, view: MarkdownView) => {
+				const line = editor.getLine(editor.getCursor().line);
+				const tidMatch = line.match(
+					/<!-- tid:([a-zA-Z0-9_-]+) -->/
+				);
+				if (!tidMatch) {
+					new Notice(
+						"Todoist Inline: No synced Todoist task on this line."
+					);
+					return;
+				}
+				const api = this.getApi();
+				if (!api) return;
+				const { TaskEditModal } = await import(
+					"./src/ui/TaskEditModal"
+				);
+				const file = view.file;
+				new TaskEditModal(this.app, api, tidMatch[1], async () => {
+					await this.pullActiveNote(file, editor);
+				}).open();
+			},
+		});
+
 		// Ribbon icon
 		this.addRibbonIcon(
 			"refresh-cw",

@@ -15,6 +15,11 @@ export interface TodoistTask {
 		datetime?: string;
 		timezone?: string;
 	};
+	deadline?: {
+		date: string;
+		lang?: string;
+		string?: string;
+	};
 }
 
 export interface TodoistSection {
@@ -42,6 +47,8 @@ export interface UpdateTaskParams {
 	content?: string;
 	priority?: number;
 	description?: string;
+	due_string?: string;
+	deadline_date?: string;
 }
 
 type ApiResponse<T> = T[] | { results: T[]; next_cursor?: string | null };
@@ -81,6 +88,10 @@ export class TodoistAPI {
 	private extractResults(data: any): any[] {
 		if (Array.isArray(data)) return data;
 		return data?.results ?? [];
+	}
+
+	async getTask(taskId: string): Promise<TodoistTask> {
+		return this.request<TodoistTask>("GET", `/tasks/${taskId}`);
 	}
 
 	async getTasks(projectId: string): Promise<TodoistTask[]> {

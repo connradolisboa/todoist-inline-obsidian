@@ -16,9 +16,11 @@ export const EMOJI_TO_PRIORITY: Record<string, number> = {
 // Matches lines like: "  - [ ] Task text" or "- [x] Task text"
 const TASK_REGEX = /^(\s*)- \[([ xX])\] (.*)$/;
 // Embedded Todoist task ID: <!-- tid:12345678 -->
-const TID_REGEX = /<!-- tid:([a-zA-Z0-9_-]+) -->/;
+export const TID_REGEX = /<!-- tid:([a-zA-Z0-9_-]+) -->/;
 // Section headings managed by plugin (level 3)
 const SECTION_REGEX = /^### (.+)$/;
+// Description lines rendered by plugin: {indent}> {text} <!-- sync-desc -->
+const SYNC_DESC_REGEX = /^(\t*)> (.*) <!-- sync-desc -->$/;
 
 export interface ParsedTask {
 	/** Zero-based line index in the note */
@@ -50,12 +52,15 @@ export interface ParsedNote {
 	preambleLines: string[];
 	tasks: ParsedTask[];
 	sections: ParsedSection[];
+	/** Line indices of plugin-managed description lines (<!-- sync-desc -->) */
+	descriptionLineIndices: Set<number>;
 }
 
 export function parseNote(content: string): ParsedNote {
 	const lines = content.split("\n");
 	const tasks: ParsedTask[] = [];
 	const sections: ParsedSection[] = [];
+	const descriptionLineIndices = new Set<number>();
 
 	// Extract frontmatter
 	let frontmatterEnd = 0;
@@ -94,6 +99,12 @@ export function parseNote(content: string): ParsedNote {
 
 	for (let i = preambleEnd; i < lines.length; i++) {
 		const line = lines[i];
+
+		// Description line (plugin-managed)
+		if (SYNC_DESC_REGEX.test(line)) {
+			descriptionLineIndices.add(i);
+			continue;
+		}
 
 		// Section heading
 		const sectionMatch = line.match(SECTION_REGEX);
@@ -157,7 +168,15 @@ export function parseNote(content: string): ParsedNote {
 		}
 	}
 
-	return { frontmatterLines, preambleLines, tasks, sections };
+	return { frontmatterLines, preambleLines, tasks, sections, descriptionLineIndices };
+}
+
+export function renderDescriptionLines(indent: number, description: string): string[] {
+	if (!description) return [];
+	const indentStr = "\t".repeat(indent);
+	return description
+		.split("\n")
+		.map((line) => `${indentStr}> ${line} <!-- sync-desc -->`);
 }
 
 export function renderTaskLine(

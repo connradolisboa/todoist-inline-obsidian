@@ -3,7 +3,11 @@ import {
 	TodoistTask,
 	TodoistSection,
 } from "../api/TodoistAPI";
-import { parseNote, renderTaskLine } from "../parser/NoteParser";
+import {
+	parseNote,
+	renderTaskLine,
+	renderDescriptionLines,
+} from "../parser/NoteParser";
 
 export interface SyncResult {
 	noteContent: string;
@@ -194,7 +198,8 @@ export class SyncEngine {
 		sections: TodoistSection[],
 		newTids: Map<number, string>
 	): string {
-		const { tasks: noteTasks } = parseNote(originalContent);
+		const { tasks: noteTasks, descriptionLineIndices } =
+			parseNote(originalContent);
 		const lines = originalContent.split("\n");
 
 		const tidToTodoist = new Map(todoistTasks.map((t) => [t.id, t]));
@@ -257,6 +262,9 @@ export class SyncEngine {
 					task.id
 				),
 			];
+			if (task.description) {
+				result.push(...renderDescriptionLines(indent, task.description));
+			}
 			const children = newTaskChildMap.get(task.id) ?? [];
 			for (const child of children) {
 				result.push(...renderNewTree(child, indent + 1));
@@ -308,6 +316,18 @@ export class SyncEngine {
 						)
 					);
 
+					// Insert fresh description lines immediately after the task
+					// (before any subtask insertions below, so ordering is correct)
+					if (todoistTask.description) {
+						addInsertAfter(
+							noteTask.line,
+							renderDescriptionLines(
+								noteTask.indent,
+								todoistTask.description
+							)
+						);
+					}
+
 					// Append new Todoist subtasks after this task's last child line
 					const newSubs = newSubsByParentTid.get(noteTask.tid) ?? [];
 					if (newSubs.length > 0) {
@@ -344,6 +364,12 @@ export class SyncEngine {
 				}
 				// No action otherwise — leave the line as typed
 			}
+		}
+
+		// Mark all plugin-managed description lines for deletion so they are
+		// regenerated fresh from Todoist data above
+		for (const lineIdx of descriptionLineIndices) {
+			lineReplacement.set(lineIdx, null);
 		}
 
 		// Build output line-by-line, tracking the current section so we know
