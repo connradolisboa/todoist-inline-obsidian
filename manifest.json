@@ -1,0 +1,10 @@
+{
+	"id": "todoist-inline-obsidian",
+	"name": "Todoist Inline",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Sync Todoist project tasks inline in Obsidian notes as checklists with 2-way sync, sections, subtasks, and priorities.",
+	"author": "connrado",
+	"authorUrl": "",
+	"isDesktopOnly": false
+}
