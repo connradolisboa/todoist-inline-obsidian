@@ -107,7 +107,11 @@ export function parseNote(content: string): ParsedNote {
 		// Task line
 		const taskMatch = line.match(TASK_REGEX);
 		if (taskMatch) {
-			const indent = taskMatch[1].length;
+			// Normalize indent to nesting level: count tabs, or divide spaces by 2
+			const leading = taskMatch[1];
+			const tabCount = (leading.match(/\t/g) ?? []).length;
+			const spaceCount = (leading.match(/ /g) ?? []).length;
+			const indent = tabCount > 0 ? tabCount : Math.floor(spaceCount / 2);
 			const checked =
 				taskMatch[2].toLowerCase() === "x";
 			let rawContent = taskMatch[3].trim();
@@ -163,7 +167,7 @@ export function renderTaskLine(
 	priority: number,
 	tid: string | null
 ): string {
-	const spaces = " ".repeat(indent);
+	const spaces = "\t".repeat(indent);
 	const checkbox = checked ? "[x]" : "[ ]";
 	const priorityEmoji =
 		PRIORITY_TO_EMOJI[priority] ? ` ${PRIORITY_TO_EMOJI[priority]}` : "";

@@ -69,13 +69,17 @@ export class SyncEngine {
 					result.tasksReopened++;
 				}
 
-				if (
-					noteTask.content !== todoistTask.content ||
-					noteTask.priority !== todoistTask.priority
-				) {
+				// Only push priority from note when it carries an explicit emoji
+				// (priority > 1). Otherwise let Todoist's priority win so that
+				// priorities set in Todoist are pulled back to the note correctly.
+				const priorityChanged =
+					noteTask.priority > 1 &&
+					noteTask.priority !== todoistTask.priority;
+
+				if (noteTask.content !== todoistTask.content || priorityChanged) {
 					await this.api.updateTask(noteTask.tid, {
 						content: noteTask.content,
-						priority: noteTask.priority,
+						...(priorityChanged ? { priority: noteTask.priority } : {}),
 					});
 					result.tasksUpdated++;
 				}
@@ -255,7 +259,7 @@ export class SyncEngine {
 			];
 			const children = newTaskChildMap.get(task.id) ?? [];
 			for (const child of children) {
-				result.push(...renderNewTree(child, indent + 2));
+				result.push(...renderNewTree(child, indent + 1));
 			}
 			return result;
 		};
@@ -313,7 +317,7 @@ export class SyncEngine {
 						addInsertAfter(
 							insertLine,
 							newSubs.flatMap((sub) =>
-								renderNewTree(sub, noteTask.indent + 2)
+								renderNewTree(sub, noteTask.indent + 1)
 							)
 						);
 					}
